@@ -1,0 +1,42 @@
+name: Compute median APR
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compute-apr
+  cancel-in-progress: false
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'uv.lock'
+
+      - run: uv sync --frozen
+
+      - run: uv run --no-sync python compute.py --out data/eth-median-apr.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/eth-median-apr.json
+          if git diff --cached --quiet; then
+            echo "No change to data/eth-median-apr.json — skipping commit."
+          else
+            END_DATE=$(jq -r .end_date data/eth-median-apr.json)
+            git commit -m "data: update eth-median-apr (window end ${END_DATE})"
+            git push
+          fi

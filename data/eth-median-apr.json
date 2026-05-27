@@ -1,0 +1,68 @@
+{
+  "schema_version": "2.0.0",
+  "metric": "eth_validator_median_apr",
+  "unit": "percent_per_year",
+  "end_date": "2026-05-24",
+  "end_epoch": 449888,
+  "windows": {
+    "7d": {
+      "start_date": "2026-05-17",
+      "start_epoch": 448313,
+      "value_pct": 2.23,
+      "distribution_pct": {
+        "p10": 2.2156,
+        "p25": 2.2241,
+        "median": 2.2276,
+        "mean": 2.6197,
+        "p75": 2.2297,
+        "p90": 2.2307,
+        "p99": 10.3819
+      },
+      "n_validators": 888384,
+      "n_withdrawal_events": 803776
+    },
+    "30d": {
+      "start_date": "2026-04-24",
+      "start_epoch": 443138,
+      "value_pct": 2.23,
+      "distribution_pct": {
+        "p10": 2.2251,
+        "p25": 2.2313,
+        "median": 2.2341,
+        "mean": 2.6353,
+        "p75": 2.236,
+        "p90": 4.0946,
+        "p99": 9.4505
+      },
+      "n_validators": 866280,
+      "n_withdrawal_events": 3445200
+    },
+    "90d": {
+      "start_date": "2026-02-23",
+      "start_epoch": 429638,
+      "value_pct": 2.25,
+      "distribution_pct": {
+        "p10": 2.234,
+        "p25": 2.2417,
+        "median": 2.2458,
+        "mean": 3.4822,
+        "p75": 2.8616,
+        "p90": 3.4687,
+        "p99": 5.2844
+      },
+      "n_validators": 822343,
+      "n_withdrawal_events": 10268267
+    }
+  },
+  "computed_at": "2026-05-27T06:29:09Z",
+  "source": {
+    "name": "Xatu",
+    "operator": "EthPandaOps / Ethereum Foundation",
+    "url": "https://github.com/ethpandaops/xatu-data",
+    "license": "CC BY 4.0",
+    "tables": [
+      "canonical_beacon_validators",
+      "canonical_beacon_block_withdrawal"
+    ]
+  }
+}
