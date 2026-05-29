@@ -26,6 +26,10 @@ SCHEMA_VERSION = "2.0.0"
 DEFAULT_WINDOWS = [7, 30, 90]
 SAFETY_LAG_DAYS = 3  # Xatu publishes daily files with 1–3 day delay.
 MIN_ACTIVE_EFFECTIVE_BALANCE_GWEI = 31_000_000_000  # 31 ETH floor for active validators.
+SECONDS_PER_EPOCH = 384  # 32 slots × 12s; stable on mainnet since the Beacon Chain genesis.
+ANNUALIZATION_TOLERANCE_DAYS = 0.5  # Realized epoch span must match the nominal window this closely.
+REMOTE_READ_ATTEMPTS = 4    # Total tries for a known-good remote read before giving up.
+REMOTE_READ_BASE_DELAY = 2.0  # Backoff base: 2s, 4s, 8s between retries.
 VALUE_PCT_DIGITS = 2     # Headline value_pct rounded to 2 dp for readability.
 DISTRIBUTION_PCT_DIGITS = 4  # Distribution percentiles need finer precision; the
                               # middle of the validator distribution spans ~1 bp,
@@ -61,6 +65,29 @@ def daterange(start: date, end: date):
         cur += timedelta(days=1)
 
 
+def read_with_retry(thunk, what: str):
+    """Run a DuckDB read that targets a known-good URL, retrying transient errors.
+
+    A 404 on a genuinely-missing file is indistinguishable from a transient network
+    blip at the duckdb.Error level, so we retry either way and let the last attempt
+    re-raise. Callers should only wrap reads whose target is expected to exist (the
+    end snapshot is already resolved; start snapshots and withdrawal files are
+    historical), never the find_latest_available_date probe whose 404s are expected.
+    """
+    for i in range(REMOTE_READ_ATTEMPTS):
+        try:
+            return thunk()
+        except duckdb.Error as e:
+            if i == REMOTE_READ_ATTEMPTS - 1:
+                raise
+            delay = REMOTE_READ_BASE_DELAY * (2**i)
+            print(
+                f"  transient read error on {what} ({e}); retry {i + 1}/{REMOTE_READ_ATTEMPTS - 1} in {delay:.0f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 def decode_withdrawal_amounts(blobs) -> np.ndarray:
     """Decode N × 16-byte little-endian uint128 blobs to a uint64 numpy array.
 
@@ -72,7 +99,12 @@ def decode_withdrawal_amounts(blobs) -> np.ndarray:
         return np.array([], dtype=np.uint64)
     if blobs[0] is None or len(blobs[0]) != 16:
         raise ValueError(f"Unexpected withdrawal_amount blob shape: first row = {blobs[0]!r}")
-    buf = b"".join(blobs)
+    try:
+        buf = b"".join(blobs)
+    except TypeError as e:
+        # A None (or other non-bytes) value past row 0 lands here; surface it as a
+        # clear ValueError instead of an opaque join TypeError.
+        raise ValueError(f"withdrawal_amount column contains a non-bytes row: {e}") from e
     if len(buf) != len(blobs) * 16:
         raise ValueError(
             f"Withdrawal blob size mismatch: {len(buf)} bytes for {len(blobs)} rows"
@@ -81,7 +113,36 @@ def decode_withdrawal_amounts(blobs) -> np.ndarray:
 
 
 def epoch_of(con, url: str) -> int:
-    return int(con.execute(f"SELECT MIN(epoch) FROM read_parquet('{url}')").fetchone()[0])
+    row = read_with_retry(
+        lambda: con.execute(f"SELECT MIN(epoch) FROM read_parquet('{url}')").fetchone(),
+        what=f"epoch_of({url})",
+    )
+    return int(row[0])
+
+
+def check_realized_span(start_epoch: int, end_epoch: int, window_days: int) -> float:
+    """Realized span (days) between two snapshots; raise if it deviates from nominal.
+
+    The annualization assumes the snapshots are exactly `window_days` apart. Validate
+    that against the realized epoch span so a shifted/anomalous snapshot aborts loudly
+    rather than silently mis-annualizing the published APR.
+    """
+    realized_days = (end_epoch - start_epoch) * SECONDS_PER_EPOCH / 86400.0
+    if abs(realized_days - window_days) > ANNUALIZATION_TOLERANCE_DAYS:
+        raise RuntimeError(
+            f"[{window_days}d] realized span {realized_days:.3f}d (epochs {start_epoch}→{end_epoch}) "
+            f"deviates >{ANNUALIZATION_TOLERANCE_DAYS}d from the nominal {window_days}d window; "
+            f"refusing to annualize"
+        )
+    return realized_days
+
+
+def normalize_windows(windows: list[int]) -> list[int]:
+    """Dedupe, sort, and reject non-positive window sizes. Raises ValueError if empty."""
+    windows = sorted({int(w) for w in windows if int(w) >= 1})
+    if not windows:
+        raise ValueError("windows must contain at least one positive integer")
+    return windows
 
 
 def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_days: int):
@@ -98,13 +159,18 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
     start_epoch = epoch_of(con, start_url)
     print(f"  [{window_days}d] window {start_date} → {end_date}", file=sys.stderr)
 
+    check_realized_span(start_epoch, end_epoch, window_days)
+
     # Withdrawals over the half-open interval [start_date, end_date).
     withdraw_urls = [withdrawal_url(d) for d in daterange(start_date, end_date)]
     withdraw_globs = "[" + ",".join(f"'{u}'" for u in withdraw_urls) + "]"
-    wdf = con.execute(
-        f"SELECT withdrawal_validator_index AS idx, withdrawal_amount AS amt "
-        f"FROM read_parquet({withdraw_globs})"
-    ).df()
+    wdf = read_with_retry(
+        lambda: con.execute(
+            f"SELECT withdrawal_validator_index AS idx, withdrawal_amount AS amt "
+            f"FROM read_parquet({withdraw_globs})"
+        ).df(),
+        what=f"{window_days}d withdrawals",
+    )
     n_withdrawals = len(wdf)
 
     amounts_gwei = decode_withdrawal_amounts(wdf["amt"].values)
@@ -114,8 +180,9 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
     # Register under a window-specific name so multiple windows can coexist.
     con.register(f"w_{window_days}", sum_per_validator)
 
-    row = con.execute(
-        f"""
+    row = read_with_retry(
+        lambda: con.execute(
+            f"""
         WITH
         s AS (
             SELECT
@@ -155,7 +222,17 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
             AVG(apr_pct)
         FROM rates
         """
-    ).fetchone()
+        ).fetchone(),
+        what=f"{window_days}d rates",
+    )
+    # COUNT(*) is 0 and the quantile list is NULL when no validator survives the
+    # join + filters; guard before unpacking so we fail loud instead of hitting an
+    # opaque "cannot unpack NoneType" on the quantile row.
+    if not row[0] or row[1] is None:
+        raise RuntimeError(
+            f"[{window_days}d] no validators survived filtering (start {start_date} → end {end_date}); "
+            f"cannot compute a median"
+        )
     n, quantiles, mean = row
     p10, p25, median, p75, p90, p99 = quantiles
 
@@ -181,10 +258,7 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
 def compute(windows: list[int] | None = None):
     if windows is None:
         windows = DEFAULT_WINDOWS
-    # Dedupe + sort + reject non-positive.
-    windows = sorted({int(w) for w in windows if int(w) >= 1})
-    if not windows:
-        raise ValueError("windows must contain at least one positive integer")
+    windows = normalize_windows(windows)
 
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -250,10 +324,15 @@ def main():
     parser.add_argument("--out", type=Path, default=None, help="Write to file (default stdout)")
     args = parser.parse_args()
 
+    # Bad --windows is a usage error (exit 2); anything that fails later inside
+    # compute() is a data/runtime error and should propagate as a normal failure
+    # (traceback, exit 1) so the CI job fails and the on-failure issue step fires.
     try:
-        result = compute(args.windows)
+        windows = normalize_windows(args.windows)
     except ValueError as e:
         parser.error(str(e))
+
+    result = compute(windows)
     payload = json.dumps(result, indent=2) + "\n"
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
