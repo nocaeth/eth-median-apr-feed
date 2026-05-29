@@ -10,7 +10,7 @@
  * For a cached + last-good-value fallback pattern, see examples/consume-with-cache.ts.
  */
 
-/** Per-validator APR distribution (percent units, 2 decimal places). */
+/** Per-validator APR distribution (percent units, 4 decimal places). */
 export type DistributionPct = {
   p10: number
   p25: number
@@ -36,6 +36,11 @@ export type WindowResult = {
   n_withdrawal_events: number
 }
 
+/**
+ * The published feed always carries exactly these three windows — the weekly job
+ * runs the default 7/30/90. (A local `--windows` override can emit other keys, but
+ * that output is never published, so consumers of the feed only ever see these.)
+ */
 export type WindowKey = '7d' | '30d' | '90d'
 
 export type EthMedianAprFeed = {
@@ -71,8 +76,14 @@ export async function fetchEthMedianApr(): Promise<EthMedianAprFeed> {
     throw new Error(`eth-median-apr-feed: HTTP ${res.status}`)
   }
   const data = (await res.json()) as EthMedianAprFeed
+  if (typeof data?.schema_version !== 'string') {
+    throw new Error('eth-median-apr-feed: malformed response (missing or non-string schema_version)')
+  }
   if (!data.schema_version.startsWith('2.')) {
     throw new Error(`eth-median-apr-feed: incompatible schema ${data.schema_version}`)
+  }
+  if (typeof data.windows !== 'object' || data.windows === null) {
+    throw new Error('eth-median-apr-feed: malformed response (missing windows)')
   }
   return data
 }

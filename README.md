@@ -43,7 +43,7 @@ Take the median across validators whose status is `active_ongoing` at both endpo
 
 ### What it measures
 
-CL-only rewards (attestations, proposer CL portion, sync committee) — EL rewards (priority fees + MEV) go to the fee_recipient address and don't accrue to CL balance. This does not move the median: the median validator proposes zero blocks in the window, so EL contributions are mechanically zero at p50. EL only lifts p75 and above.
+CL-only rewards (attestations, proposer CL portion, sync committee). EL rewards (priority fees + MEV) go to the fee_recipient address and never touch CL balance, so they are excluded at **every** percentile, not just the median. The median validator earns only attestation rewards over the window, so p50 reflects baseline CL yield; the upper tail (p75+) is lifted by lumpy *CL* income — block-proposal and sync-committee rewards — not by EL.
 
 ### Withdrawal correction
 

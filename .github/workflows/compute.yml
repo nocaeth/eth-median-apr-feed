@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  issues: write  # open a tracking issue if an unattended run fails
 
 concurrency:
   group: compute-apr
@@ -17,14 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0  # full history so the push rebase-retry can actually rebase
 
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
         with:
           enable-cache: true
           cache-dependency-glob: 'uv.lock'
 
-      - run: uv sync --frozen
+      - run: uv sync --frozen --no-dev
 
       - run: uv run --no-sync python compute.py --out data/eth-median-apr.json
 
@@ -38,5 +41,33 @@ jobs:
           else
             END_DATE=$(jq -r .end_date data/eth-median-apr.json)
             git commit -m "data: update eth-median-apr (window end ${END_DATE})"
-            git push
+            # main can advance during the run; rebase our single-file commit and retry.
+            pushed=false
+            for attempt in 1 2 3; do
+              if git push; then pushed=true; break; fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "push rejected (attempt ${attempt}); rebasing on origin/main"
+                git pull --rebase origin main || break  # a rebase conflict is fatal — fail loud
+              fi
+            done
+            if [ "$pushed" = false ]; then
+              echo "push failed after rebase retries" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `|| echo 0` so a transient list failure doesn't abort the step (set -e) and
+          # suppress the issue; state:open is in the query so the filter is unambiguous.
+          existing=$(gh issue list --search 'in:title "compute-apr run failed" state:open' --json number --jq 'length' || echo 0)
+          if [ "${existing:-0}" -eq 0 ]; then
+            gh issue create \
+              --title "compute-apr run failed" \
+              --body "The weekly APR computation failed on $(date -u +%Y-%m-%dT%H:%MZ). Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            echo "An open 'compute-apr run failed' issue already exists; not opening another."
           fi

@@ -19,9 +19,23 @@ type CacheEntry = {
   computed_at: string
 }
 
+// Use localStorage in the browser; fall back to an in-memory store under Bun/Node so
+// this example actually exercises the cache path when run with `bun run` (in a server
+// you'd swap this for Redis, a file, or your DB).
+const store: Pick<Storage, 'getItem' | 'setItem'> =
+  typeof localStorage !== 'undefined'
+    ? localStorage
+    : (() => {
+        const mem = new Map<string, string>()
+        return {
+          getItem: (k: string) => mem.get(k) ?? null,
+          setItem: (k: string, v: string) => void mem.set(k, v),
+        }
+      })()
+
 function readCache(): CacheEntry | null {
   try {
-    const raw = localStorage.getItem(CACHE_KEY)
+    const raw = store.getItem(CACHE_KEY)
     return raw ? (JSON.parse(raw) as CacheEntry) : null
   } catch {
     return null
@@ -30,9 +44,9 @@ function readCache(): CacheEntry | null {
 
 function writeCache(entry: CacheEntry): void {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(entry))
+    store.setItem(CACHE_KEY, JSON.stringify(entry))
   } catch {
-    // localStorage disabled / quota — best effort
+    // store unavailable / quota — best effort
   }
 }
 
@@ -68,8 +82,9 @@ export async function getBenchmark(): Promise<number> {
   }
 }
 
-// Demo:
-if (typeof localStorage !== 'undefined') {
+// Demo — only when run directly (`bun run`), not when getBenchmark is imported,
+// so importing this module never triggers a network fetch as a side effect.
+if (import.meta.main) {
   const value = await getBenchmark()
   console.log(`ETH median validator APR: ${value}%`)
 }
