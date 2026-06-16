@@ -1,12 +1,17 @@
-"""Compute the median ETH validator APR over 7d / 30d / 90d rolling windows.
+"""Compute ETH validator APR over 7d / 30d / 90d rolling windows.
 
 Source: Xatu public Parquet dataset (https://github.com/ethpandaops/xatu-data).
 No API keys. CC BY 4.0.
 
-Per-validator rate = (end_balance − start_balance + sum_withdrawals) / start_effective_balance.
-Annualize, then take the median across the active set. Dividing by each validator's
-own effective_balance (not a constant 32 ETH) is what makes the metric correct in the
-post-Pectra MAXEB regime where validators can hold up to 2048 ETH.
+Consensus layer (the median + distribution): per-validator rate =
+(end_balance − start_balance + sum_withdrawals) / start_effective_balance, annualized, then
+the median/percentiles across the active set. Dividing by each validator's own
+effective_balance (not a constant 32 ETH) is what makes the metric correct in the post-Pectra
+MAXEB regime where validators can hold up to 2048 ETH.
+
+Execution layer (the `execution` block + `total_apr_pct`): MEV-Boost proposer payments from the
+relay data, aggregated network-wide (Σ value / Σ active stake). EL rewards never touch the
+validator's CL balance, so they require this separate source — see compute_execution.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import duckdb
 import numpy as np
 
 XATU_BASE = "https://data.ethpandaops.io/xatu/mainnet/databases/default"
-SCHEMA_VERSION = "2.0.0"
+SCHEMA_VERSION = "2.1.0"  # 2.1.0 adds additive execution-layer fields; 2.x consumers unaffected.
 DEFAULT_WINDOWS = [7, 30, 90]
 SAFETY_LAG_DAYS = 3  # Xatu publishes daily files with 1–3 day delay.
 MIN_ACTIVE_EFFECTIVE_BALANCE_GWEI = 31_000_000_000  # 31 ETH floor for active validators.
@@ -34,6 +39,8 @@ VALUE_PCT_DIGITS = 2     # Headline value_pct rounded to 2 dp for readability.
 DISTRIBUTION_PCT_DIGITS = 4  # Distribution percentiles need finer precision; the
                               # middle of the validator distribution spans ~1 bp,
                               # which would collapse if rounded to 2 dp.
+MEV_ETH_DIGITS = 6  # Per-block MEV-Boost payments are O(0.01 ETH); needs sub-gwei precision.
+MIN_MEV_BLOCKS_PER_DAY = 2000  # Sanity floor (real mainnet ~6500/day); below this = relay data gap.
 
 
 def validators_url(d: date) -> str:
@@ -42,6 +49,10 @@ def validators_url(d: date) -> str:
 
 def withdrawal_url(d: date) -> str:
     return f"{XATU_BASE}/canonical_beacon_block_withdrawal/{d.year}/{d.month}/{d.day}.parquet"
+
+
+def mev_payload_url(d: date) -> str:
+    return f"{XATU_BASE}/mev_relay_proposer_payload_delivered/{d.year}/{d.month}/{d.day}.parquet"
 
 
 def find_latest_available_date(con) -> date:
@@ -112,6 +123,25 @@ def decode_withdrawal_amounts(blobs) -> np.ndarray:
     return np.frombuffer(buf, dtype="<u8").reshape(-1, 2)[:, 0]
 
 
+def decode_payload_values_eth(blobs) -> np.ndarray:
+    """Decode MEV-Boost `value` blobs (little-endian uint256 wei) to ETH (float64).
+
+    Unlike withdrawal amounts (always ≤ uint64), a block's MEV value can in principle
+    exceed uint64, so we decode each blob exactly with int.from_bytes rather than slicing
+    a fixed low word. After dedup the row count is one-per-block (sub-million even at 90d),
+    so the Python-level decode is cheap; the float64 result is exact at ETH scale.
+    """
+    n = len(blobs)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    wei = np.fromiter(
+        (int.from_bytes(bytes(b), "little") for b in blobs),
+        dtype=np.float64,
+        count=n,
+    )
+    return wei / 1e18
+
+
 def epoch_of(con, url: str) -> int:
     row = read_with_retry(
         lambda: con.execute(f"SELECT MIN(epoch) FROM read_parquet('{url}')").fetchone(),
@@ -143,6 +173,72 @@ def normalize_windows(windows: list[int]) -> list[int]:
     if not windows:
         raise ValueError("windows must contain at least one positive integer")
     return windows
+
+
+def compute_execution(con, start_date: date, end_date: date, start_url: str,
+                      start_epoch: int, window_days: int) -> dict:
+    """Aggregate execution-layer (MEV-Boost) reward for the window.
+
+    Execution rewards (priority fees + MEV) are paid to the proposer's fee_recipient on
+    the EL — they never touch the validator's beacon balance, so the consensus metric in
+    compute_window cannot see them. We read the MEV-relay `proposer_payload_delivered`
+    table, where `value` is the payment delivered to the proposer per block.
+
+    Two deliberate methodology choices:
+    - AGGREGATE, not median: most validators propose no block in a window, so a per-validator
+      median EL APR is ~0. The meaningful figure is network-aggregate: total payments over
+      total active stake. We still surface mean/median ETH-per-block for the raw distribution.
+    - LOWER BOUND: this covers only MEV-Boost blocks. Locally-built blocks (~10%) earn priority
+      fees not captured here; closing that gap is a future pass over canonical_execution_*.
+    """
+    # Denominator: total active effective balance at the start snapshot (gwei), reusing the
+    # object-cached start parquet. Unlike the CL median (which filters to the unchanged-eb
+    # subset), the EL aggregate is a network rate, so it uses ALL active validators.
+    total_eb_gwei = read_with_retry(
+        lambda: con.execute(
+            f"""
+        SELECT SUM(effective_balance)::DOUBLE
+        FROM read_parquet('{start_url}')
+        WHERE epoch = {start_epoch}
+          AND CAST(status AS VARCHAR) = 'active_ongoing'
+          AND effective_balance >= {MIN_ACTIVE_EFFECTIVE_BALANCE_GWEI}
+        """
+        ).fetchone(),
+        what=f"{window_days}d total effective balance",
+    )[0]
+    if not total_eb_gwei:
+        raise RuntimeError(f"[{window_days}d] zero active effective balance at start snapshot")
+
+    # Dedup by block_hash: the same delivered block is logged once per relay AND per Xatu
+    # sentry, so the raw rows multi-count. One distinct block_hash = one proposer payment.
+    mev_urls = [mev_payload_url(d) for d in daterange(start_date, end_date)]
+    mev_globs = "[" + ",".join(f"'{u}'" for u in mev_urls) + "]"
+    rows = read_with_retry(
+        lambda: con.execute(
+            f"""
+        SELECT any_value(value) AS value
+        FROM read_parquet({mev_globs})
+        GROUP BY block_hash
+        """
+        ).df(),
+        what=f"{window_days}d MEV payloads",
+    )
+    n_blocks = len(rows)
+    values_eth = decode_payload_values_eth(rows["value"].values)
+    total_value_eth = float(values_eth.sum()) if n_blocks else 0.0
+    total_eb_eth = float(total_eb_gwei) / 1e9
+    apr_pct = total_value_eth / total_eb_eth * 365.0 / window_days * 100.0
+
+    return {
+        "apr_pct": round(apr_pct, VALUE_PCT_DIGITS),
+        "mev_eth_per_block": {
+            "mean": round(float(values_eth.mean()), MEV_ETH_DIGITS) if n_blocks else 0.0,
+            "median": round(float(np.median(values_eth)), MEV_ETH_DIGITS) if n_blocks else 0.0,
+        },
+        "n_mev_blocks": n_blocks,
+        "note": "MEV-Boost proposer payments only; lower bound (excludes locally-built blocks)",
+        "_raw_apr_pct": apr_pct,  # consumed by the caller for total + the sanity gate
+    }
 
 
 def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_days: int):
@@ -206,10 +302,8 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
         ),
         rates AS (
             SELECT
-                (e.balance - s.balance + COALESCE(w.withdrawn::BIGINT, 0))::DOUBLE
-                    / s.eb::DOUBLE
-                    * 365.0 / {window_days}
-                    * 100 AS apr_pct
+                (e.balance - s.balance + COALESCE(w.withdrawn::BIGINT, 0))::DOUBLE AS reward_gwei,
+                s.eb::DOUBLE AS eb
             FROM s JOIN e USING (index) LEFT JOIN w_{window_days} w USING (index)
             -- Exclude validators whose effective_balance changed during the window:
             -- consolidations (post-Pectra) and slashings both manifest as eb deltas,
@@ -218,8 +312,14 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
         )
         SELECT
             COUNT(*),
-            quantile_cont(apr_pct, [0.10, 0.25, 0.50, 0.75, 0.90, 0.99]),
-            AVG(apr_pct)
+            -- Per-validator distribution (each validator one vote, regardless of stake).
+            quantile_cont(reward_gwei / eb * 365.0 / {window_days} * 100,
+                          [0.10, 0.25, 0.50, 0.75, 0.90, 0.99]),
+            AVG(reward_gwei / eb * 365.0 / {window_days} * 100),
+            -- Stake-weighted aggregate (Σ rewards ÷ Σ stake): a 2048-ETH validator counts 64×
+            -- a 32-ETH one. This is the correct basis for a network / large-operator yield,
+            -- and the consensus term added to the (also stake-denominated) execution APR.
+            SUM(reward_gwei) / SUM(eb) * 365.0 / {window_days} * 100
         FROM rates
         """
         ).fetchone(),
@@ -233,8 +333,15 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
             f"[{window_days}d] no validators survived filtering (start {start_date} → end {end_date}); "
             f"cannot compute a median"
         )
-    n, quantiles, mean = row
+    n, quantiles, mean, consensus_apr = row
     p10, p25, median, p75, p90, p99 = quantiles
+
+    execution = compute_execution(con, start_date, end_date, start_url, start_epoch, window_days)
+    raw_exec_apr = execution.pop("_raw_apr_pct")
+    # Total ≈ a large operator's realized yield: the STAKE-WEIGHTED consensus aggregate (not the
+    # per-validator mean, which over-weights small validators) plus the (also stake-weighted)
+    # execution aggregate. The headline median/distribution stay per-validator and consensus-only.
+    total_apr_pct = consensus_apr + raw_exec_apr
 
     return {
         "start_date": start_date.isoformat(),
@@ -249,9 +356,14 @@ def compute_window(con, end_date: date, end_epoch: int, end_url: str, window_day
             "p90": round(p90, DISTRIBUTION_PCT_DIGITS),
             "p99": round(p99, DISTRIBUTION_PCT_DIGITS),
         },
+        "consensus_apr_pct": round(consensus_apr, VALUE_PCT_DIGITS),
         "n_validators": int(n),
         "n_withdrawal_events": int(n_withdrawals),
+        "execution": execution,
+        "total_apr_pct": round(total_apr_pct, VALUE_PCT_DIGITS),
         "_raw_median_pct": float(median),  # consumed by the all-or-nothing gate below
+        "_raw_consensus_apr_pct": float(consensus_apr),
+        "_raw_execution_apr_pct": float(raw_exec_apr),
     }
 
 
@@ -286,8 +398,25 @@ def compute(windows: list[int] | None = None):
             raise RuntimeError(f"{key} median {median:.4f}% outside sane band [0.5, 10.0]")
         if n < 500_000:
             raise RuntimeError(f"{key} has only {n} validators — sample seems wrong")
+        consensus_apr = w["_raw_consensus_apr_pct"]
+        if not (0.5 <= consensus_apr <= 10.0):
+            raise RuntimeError(
+                f"{key} consensus aggregate APR {consensus_apr:.4f}% outside sane band [0.5, 10.0]"
+            )
+        exec_apr = w["_raw_execution_apr_pct"]
+        if not (0.0 <= exec_apr <= 5.0):
+            raise RuntimeError(f"{key} execution APR {exec_apr:.4f}% outside sane band [0.0, 5.0]")
+        window_days = int(key[:-1])  # "7d" -> 7
+        n_mev = w["execution"]["n_mev_blocks"]
+        if n_mev < window_days * MIN_MEV_BLOCKS_PER_DAY:
+            raise RuntimeError(
+                f"{key} has only {n_mev} MEV blocks (<{window_days * MIN_MEV_BLOCKS_PER_DAY}); "
+                f"relay data gap?"
+            )
     for w in window_results.values():
         w.pop("_raw_median_pct", None)
+        w.pop("_raw_consensus_apr_pct", None)
+        w.pop("_raw_execution_apr_pct", None)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -305,6 +434,7 @@ def compute(windows: list[int] | None = None):
             "tables": [
                 "canonical_beacon_validators",
                 "canonical_beacon_block_withdrawal",
+                "mev_relay_proposer_payload_delivered",
             ],
         },
     }

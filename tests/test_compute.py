@@ -60,6 +60,33 @@ class TestDecodeWithdrawalAmounts:
             compute.decode_withdrawal_amounts(np.array([_blob(1), b"\x00" * 8], dtype=object))
 
 
+class TestDecodePayloadValuesEth:
+    def test_empty(self):
+        out = compute.decode_payload_values_eth(np.array([], dtype=object))
+        assert out.dtype == np.float64
+        assert len(out) == 0
+
+    def test_decodes_le_wei_to_eth(self):
+        # 0.1 ETH and 1 ETH as 32-byte little-endian uint256, like the relay `value` column.
+        vals = np.array([(10**17).to_bytes(32, "little"), (10**18).to_bytes(32, "little")], dtype=object)
+        out = compute.decode_payload_values_eth(vals)
+        assert out.tolist() == pytest.approx([0.1, 1.0])
+
+    def test_accepts_bytearray_and_mixed_widths(self):
+        # DuckDB hands BLOBs back as bytearray; int.from_bytes handles any width exactly.
+        arr = np.empty(2, dtype=object)
+        arr[0] = bytearray((5 * 10**16).to_bytes(32, "little"))  # 0.05 ETH, 32-byte
+        arr[1] = (3 * 10**16).to_bytes(16, "little")             # 0.03 ETH, 16-byte
+        out = compute.decode_payload_values_eth(arr)
+        assert out.tolist() == pytest.approx([0.05, 0.03])
+
+    def test_value_above_uint64(self):
+        # A whale MEV block (>18.4 ETH) overflows uint64; exact decode must still hold.
+        big = 25 * 10**18  # 25 ETH in wei, > 2**64
+        out = compute.decode_payload_values_eth(np.array([big.to_bytes(32, "little")], dtype=object))
+        assert out[0] == pytest.approx(25.0)
+
+
 class TestDaterange:
     def test_half_open(self):
         from datetime import date
