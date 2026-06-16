@@ -21,6 +21,26 @@ export type DistributionPct = {
   p99: number
 }
 
+/** Raw per-block MEV-Boost proposer payment (ETH, 6 decimal places). */
+export type MevEthPerBlock = {
+  mean: number
+  median: number
+}
+
+/**
+ * Execution-layer (MEV-Boost) rewards for the window. Added in schema 2.1.0.
+ *
+ * `apr_pct` is a NETWORK AGGREGATE (total proposer payments ÷ total active stake), not a
+ * per-validator median — most validators propose no block in a window, so a median would be ~0.
+ * It is a LOWER BOUND: only MEV-Boost blocks are counted; locally-built blocks (~10%) are not.
+ */
+export type ExecutionResult = {
+  apr_pct: number
+  mev_eth_per_block: MevEthPerBlock
+  n_mev_blocks: number
+  note: string
+}
+
 /** One rolling window's worth of data. Window length is the parent key (`7d` → 7 days). */
 export type WindowResult = {
   /** ISO date YYYY-MM-DD — window starts here, inclusive. */
@@ -30,10 +50,25 @@ export type WindowResult = {
   /** Median APR as percentage, e.g. 2.23. Convenience alias for distribution_pct.median. */
   value_pct: number
   distribution_pct: DistributionPct
+  /**
+   * Stake-weighted consensus APR aggregate (Σ CL rewards ÷ Σ stake). The stake-weighted
+   * counterpart to `distribution_pct.mean` (which is per-validator, unweighted — a 32-ETH and a
+   * 2048-ETH validator count equally, inflating it via the proposer/sync lottery). This is the
+   * correct basis for an aggregate-capital yield and is what feeds `total_apr_pct`. Added 2.1.0.
+   */
+  consensus_apr_pct?: number
   /** Active validators included in this window's calculation. */
   n_validators: number
   /** Withdrawal events summed across this window. */
   n_withdrawal_events: number
+  /** Execution-layer (MEV-Boost) rewards. Added in 2.1.0; optional so 2.0.0 payloads type-check. */
+  execution?: ExecutionResult
+  /**
+   * Realized total ≈ `consensus_apr_pct` (stake-weighted) + `execution.apr_pct`.
+   * Approximates what a large, well-run operator earns (vs. the consensus-only median
+   * headline). Added in 2.1.0; optional for back-compat.
+   */
+  total_apr_pct?: number
 }
 
 /**
