@@ -2,59 +2,59 @@
   "schema_version": "2.0.0",
   "metric": "eth_validator_median_apr",
   "unit": "percent_per_year",
-  "end_date": "2026-07-03",
-  "end_epoch": 458888,
+  "end_date": "2026-07-10",
+  "end_epoch": 460463,
   "windows": {
     "7d": {
-      "start_date": "2026-06-26",
-      "start_epoch": 457313,
+      "start_date": "2026-07-03",
+      "start_epoch": 458888,
       "value_pct": 2.19,
       "distribution_pct": {
-        "p10": 2.1659,
-        "p25": 2.1889,
-        "median": 2.1941,
-        "mean": 2.3989,
-        "p75": 2.1965,
-        "p90": 2.1979,
-        "p99": 10.454
+        "p10": 2.1739,
+        "p25": 2.1822,
+        "median": 2.1878,
+        "mean": 2.5763,
+        "p75": 2.1902,
+        "p90": 2.1915,
+        "p99": 10.4736
       },
-      "n_validators": 873126,
-      "n_withdrawal_events": 744672
+      "n_validators": 872047,
+      "n_withdrawal_events": 803152
     },
     "30d": {
-      "start_date": "2026-06-03",
-      "start_epoch": 452138,
-      "value_pct": 2.21,
+      "start_date": "2026-06-10",
+      "start_epoch": 453713,
+      "value_pct": 2.2,
       "distribution_pct": {
-        "p10": 2.1839,
-        "p25": 2.2014,
-        "median": 2.2052,
-        "mean": 2.5535,
-        "p75": 2.2072,
-        "p90": 4.0792,
-        "p99": 8.5191
+        "p10": 2.1763,
+        "p25": 2.1941,
+        "median": 2.1986,
+        "mean": 2.5482,
+        "p75": 2.2007,
+        "p90": 4.0778,
+        "p99": 8.3987
       },
-      "n_validators": 863062,
-      "n_withdrawal_events": 3383808
+      "n_validators": 862861,
+      "n_withdrawal_events": 3384048
     },
     "90d": {
-      "start_date": "2026-04-04",
-      "start_epoch": 438638,
+      "start_date": "2026-04-11",
+      "start_epoch": 440213,
       "value_pct": 2.22,
       "distribution_pct": {
-        "p10": 2.2113,
-        "p25": 2.221,
-        "median": 2.2242,
-        "mean": 2.6064,
-        "p75": 2.8466,
-        "p90": 3.4583,
-        "p99": 5.3035
+        "p10": 2.2073,
+        "p25": 2.2172,
+        "median": 2.2206,
+        "mean": 2.6018,
+        "p75": 2.8436,
+        "p90": 3.4558,
+        "p99": 5.3016
       },
-      "n_validators": 814230,
-      "n_withdrawal_events": 10273200
+      "n_validators": 813597,
+      "n_withdrawal_events": 10272832
     }
   },
-  "computed_at": "2026-07-06T09:49:36Z",
+  "computed_at": "2026-07-13T08:40:39Z",
   "source": {
     "name": "Xatu",
     "operator": "EthPandaOps / Ethereum Foundation",
